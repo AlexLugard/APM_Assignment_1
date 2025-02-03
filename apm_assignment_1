@@ -1,0 +1,242 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import fsolve
+
+
+# Cleaning
+
+def clean_percentage(x):
+    if isinstance(x, str):
+        return float(x.replace('%', '').strip())
+    return x
+
+# PART 4(a): Yield Curve
+
+def read_data(file_path):
+    sheets = pd.read_excel(file_path, sheet_name=None)
+    yields = {}
+    for name, df in sheets.items():
+        if 'Years left(precise)' in df.columns and 'Yield to Maturity' in df.columns:
+            df = df.dropna(subset=['Years left(precise)', 'Yield to Maturity'])
+            df['Yield to Maturity'] = df['Yield to Maturity'].apply(clean_percentage)
+            # Convert to decimals
+            df['Yield to Maturity'] = df['Yield to Maturity'] / 100.0
+            yields[name] = df
+    return yields
+
+def yield_curve_plot(file_path):
+    yields = read_data(file_path)
+    maturities = np.linspace(0, 5, 50)
+    plt.figure(figsize=(8, 5))
+    for name, df in yields.items():
+        x = df['Years left(precise)'].values
+        y = df['Yield to Maturity'].values
+        # Sort the data by maturity
+        idx = np.argsort(x)
+        x, y = x[idx], y[idx]
+        interpolated_data = PchipInterpolator(x, y)
+        y_interpolated = interpolated_data(maturities)
+        plt.plot(maturities, y_interpolated*100, label=name)
+    plt.xlabel("Maturity (Years)")
+    plt.ylabel("Yield to Maturity (%)")
+    plt.title("5-Year Yield Curves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# PART 4(b): Bootstrapped Spot Curve
+    
+def select_best_5_bonds(df):
+    df = df[['Price', 'Coupon', 'Years left(precise)']].dropna().copy()
+    df["Years left(precise)"] = pd.to_numeric(df["Years left(precise)"], errors='coerce')
+    selected = []
+    targets = [1, 2, 3, 4, 5]
+    for t in targets:
+        df['diff'] = (df["Years left(precise)"] - t).abs()
+        idx = df['diff'].idxmin()
+        row = df.loc[idx]
+        coupon = clean_percentage(row['Coupon'])
+        selected.append( (row['Price'], coupon, row["Years left(precise)"]) )
+    return selected
+
+def bootstrap_spot_curve(bonds):
+    spot_rates = []
+    bonds = sorted(bonds, key=lambda x: x[2])
+    for i, (price, coupon, maturity) in enumerate(bonds):
+        #semi-annual coupon payment
+        coupon_payment = coupon * 100 / 2.0 
+        #spot rate
+        if i == 0:
+            rate = 2 * (((100 + coupon_payment) / price)**(1/(2 * maturity)) - 1)
+        else:
+            def eq(r):
+                cf_sum = 0
+                for j in range(i):
+                    cf_sum += coupon_payment / ((1 + spot_rates[j]/2) ** (2*(j+1)))
+                a = price - (cf_sum + (coupon_payment + 100) / ((1 + r/2) ** (2*maturity)))
+                return a
+            rate = fsolve(eq, 0.05)[0]
+        spot_rates.append(rate)
+    return np.array(spot_rates)
+
+def spot_curve_plot(file_path):
+    sheets = pd.read_excel(file_path, sheet_name=None)
+    plt.figure(figsize=(8, 5))
+    for name, df in sheets.items():
+        if not all(col in df.columns for col in ['Price', 'Coupon', 'Years left(precise)']):
+            continue
+        bonds = select_best_5_bonds(df)
+        if len(bonds) != 5:
+            continue
+        spot = bootstrap_spot_curve(bonds)
+        maturities = [1, 2, 3, 4, 5]
+        plt.plot(maturities, spot*100, marker='o', label=name)
+    plt.xlabel("Maturity (Years)")
+    plt.ylabel("Spot Rate (%)")
+    plt.title("Bootstrapped Spot Curves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# PART 4(c): 1-Year Forward Curve
+    
+def forward_rates(spot_rates):
+    forward = []
+    S1 = spot_rates[0]
+    # f(1,j) for j = 1,2,3,4 (i.e. forward from year1 to year j+1)
+    for j in range(1, 5):
+        Sj = spot_rates[j]
+        f = ((1+Sj)**(2*(j+1))/(1+S1)**2)**(1/(2*j)) - 1
+        forward.append(f)
+    return np.array(forward)
+
+def forward_curve(file_path):
+    sheets = pd.read_excel(file_path, sheet_name=None)
+    plt.figure(figsize=(8, 5))
+    for name, df in sheets.items():
+        if not all(col in df.columns for col in ['Price', 'Coupon', 'Years left(precise)']):
+            continue
+        bonds = select_best_5_bonds(df)
+        if len(bonds) != 5:
+            continue
+        spot = bootstrap_spot_curve(bonds)
+        print(f"Spot rates for {name}: {spot}")
+        forward = forward_rates(spot)
+        print(f"Forward rates for {name}: {forward}")
+        # Label x-axis by the ending year of the forward period:
+        maturities = [2, 3, 4, 5]
+        plt.plot(maturities, forward*100, marker='o', label=name)
+    plt.xlabel("Maturity")
+    plt.ylabel("1-Year Forward Rate (%)")
+    plt.title("1-Year Forward Curves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# PART 5: Covariance Matrices
+
+def extract_fixed_maturity_yields(file_path):
+    sheets = pd.read_excel(file_path, sheet_name=None)
+    maturity_buckets = [1, 2, 3, 4, 5] 
+    yield_data = {}
+
+    for sheet_name, df in sheets.items():
+        df = df[['Years left(precise)', 'Yield to Maturity']].dropna().copy()
+        df['Years left(precise)'] = pd.to_numeric(df['Years left(precise)'], errors='coerce')
+        df['Yield to Maturity'] = pd.to_numeric(df['Yield to Maturity'].astype(str).str.replace('%', ''), errors='coerce') / 100
+
+        selected_yields = []
+        for target in maturity_buckets:
+            df['diff'] = (df['Years left(precise)'] - target).abs()
+            closest_bond = df.loc[df['diff'].idxmin(), 'Yield to Maturity']
+            selected_yields.append(closest_bond)
+
+        yield_data[sheet_name] = selected_yields 
+
+    return pd.DataFrame.from_dict(yield_data, orient='index', columns=['1yr', '2yr', '3yr', '4yr', '5yr'])
+
+def calculate_log_returns(yield_df):
+    log_returns = np.log(yield_df / yield_df.shift(1)).dropna()
+    return log_returns
+
+def compute_covariance_matrix(log_returns):
+    return np.cov(log_returns.T)
+
+def extract_forward_rates(spot_df):
+    forward_rates_data = {}
+
+    for date, spot_rates in spot_df.iterrows():
+        forward_rates_data[date] = forward_rates(spot_rates.values)
+
+    return pd.DataFrame.from_dict(forward_rates_data, orient='index', columns=['1yr-1yr', '1yr-2yr', '1yr-3yr', '1yr-4yr'])
+
+def extract_spot_rates(file_path):
+
+    sheets = pd.read_excel(file_path, sheet_name=None)
+    spot_data = {}
+
+    for name, df in sheets.items():
+        if not all(col in df.columns for col in ['Price', 'Coupon', 'Years left(precise)']):
+            continue
+        
+        bonds = select_best_5_bonds(df)
+        if len(bonds) != 5:
+            continue
+        
+        spot_rates = bootstrap_spot_curve(bonds)
+        spot_data[name] = spot_rates
+
+    return pd.DataFrame.from_dict(spot_data, orient='index', columns=['1yr', '2yr', '3yr', '4yr', '5yr'])
+
+def calculate_log_returns(forward_df):
+    return np.log(forward_df / forward_df.shift(1)).dropna()
+
+def compute_covariance_matrix(log_returns):
+    return np.cov(log_returns.T)
+
+
+# PART 6: Eigenvectors/Eigenvalues
+
+
+def compute_eigenvalues_eigenvectors(covariance_matrix):
+    eigenvalues, eigenvectors = np.linalg.eig(covariance_matrix)
+    print("Eigenvalues: ", eigenvalues)
+    print("Eigenvectors: ", eigenvectors)
+    return eigenvalues, eigenvectors
+
+# MAIN
+
+if __name__ == "__main__":
+    file_path = "test.xlsx"  # your file name
+    print("Yield Curves:")
+    yield_curve_plot(file_path)
+    print("Spot Curves:")
+    spot_curve_plot(file_path)
+    print("Forward Curves:")
+    forward_curve(file_path)
+    fixed_yield_df = extract_fixed_maturity_yields(file_path)
+    log_returns_df_yield = calculate_log_returns(fixed_yield_df)
+    cov_matrix_yield = compute_covariance_matrix(log_returns_df_yield)
+    print("\nFixed Maturity Yields:\n", fixed_yield_df)
+    print("\nLog Returns:\n", log_returns_df_yield)
+    print("\nCovariance Matrix of Yield Rate Log Returns:\n", cov_matrix_yield)
+    spot_df = extract_spot_rates(file_path)
+    forward_rates_df = extract_forward_rates(spot_df)
+    log_returns_df_forward = calculate_log_returns(forward_rates_df)
+    cov_matrix_forward = compute_covariance_matrix(log_returns_df_forward)
+    print("\nExtracted Spot Rates:\n", spot_df)
+    print("\nForward Rates:\n", forward_rates_df)
+    print("\nLog Returns of Forward Rates:\n", log_returns_df_forward)
+    print("\nCovariance Matrix of Forward Rate Log Returns:\n", cov_matrix_forward)
+    print("Eigvenvalues/Eigenvectors for yield rates covariance matrix: \n")
+    yield_eigenvalue_vector = compute_eigenvalues_eigenvectors(cov_matrix_yield)
+    print("Eigvenvalues/Eigenvectors for forward rates covariance matrix: \n")
+    forward_eigenvalue_vector = compute_eigenvalues_eigenvectors(cov_matrix_forward)
+
+
+
